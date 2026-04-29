@@ -1,0 +1,46 @@
+{
+  "creators": [
+    {
+      "name": "Muduchuru, Kaushik",
+      "affiliation": "University/Institution",
+      "orcid": "0000-0002-8967-7872"
+    }
+  ],
+  "description": "A comprehensive framework for generative downscaling and climate data correction using diffusion models. CasCorrDiff combines deterministic regression and stochastic diffusion approaches for km-scale weather prediction and extreme event analysis, supporting multiple datasets including HRRR, GEFS, ERA5, MSWX, and Taiwan CWB data.",
+  "keywords": [
+    "downscaling",
+    "diffusion models",
+    "weather prediction",
+    "climate modeling",
+    "deep learning",
+    "atmospheric science",
+    "stochastic correction",
+    "generative models"
+  ],
+  "license": "MIT",
+  "related_identifiers": [
+    {
+      "relation": "references",
+      "identifier": "2309.15214",
+      "resource_type": "publication",
+      "scheme": "arxiv"
+    }
+  ],
+  "subjects": [
+    {
+      "term": "Atmospheric science",
+      "identifier": "http://id.loc.gov/authorities/subjects/sh85009394"
+    },
+    {
+      "term": "Weather prediction",
+      "identifier": "http://id.loc.gov/authorities/subjects/sh85145689"
+    },
+    {
+      "term": "Climate models",
+      "identifier": "http://id.loc.gov/authorities/subjects/sh2003004148"
+    }
+  ],
+  "contributors": [],
+  "access_right": "open",
+  "access_conditions": "Open Access"
+}

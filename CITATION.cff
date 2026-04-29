@@ -19,7 +19,22 @@ keywords:
 license: MIT
 version: "1.0.0"
 date-released: 2026-04-29
-
+references:
+  - type: article
+    title: "Residual corrective diffusion modeling for km-scale atmospheric downscaling"
+    authors:
+      - family-names: "Mardani"
+        given-names: "M."
+      - family-names: "Brenowitz"
+        given-names: "N."
+      - family-names: "Cohen"
+        given-names: "Y."
+    journal: "Communications Earth & Environment"
+    volume: 6
+    issue: 124
+    year: 2025
+    doi: "10.1038/s43247-025-02042-5"
+    url: "https://doi.org/10.1038/s43247-025-02042-5"
 preferred-citation:
   type: software
   title: "CasCorrDiff - Cascading Correction Diffusion Models for Atmospheric Downscaling"
