@@ -1,0 +1,653 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import contextlib
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from functools import partial
+
+import hydra
+from omegaconf import OmegaConf, DictConfig
+from hydra.utils import to_absolute_path
+import torch
+import torch._dynamo
+from torch.distributed import gather
+import numpy as np
+import nvtx
+import netCDF4 as nc
+import tqdm
+from physicsnemo.distributed import DistributedManager
+from physicsnemo.launch.logging import PythonLogger, RankZeroLoggingWrapper
+from physicsnemo.experimental.models.diffusion.preconditioning import (
+    tEDMPrecondSuperRes,
+)
+from physicsnemo.utils.patching import GridPatching2D
+from physicsnemo import Module
+from physicsnemo.utils.diffusion import deterministic_sampler, stochastic_sampler
+from physicsnemo.utils.corrdiff import (
+    NetCDFWriter,
+    # get_time_from_range,
+    regression_step,
+    diffusion_step,
+)
+
+# Custom diffusion step that supports patching
+def diffusion_step_with_patching(
+    net: torch.nn.Module,
+    sampler_fn: callable,
+    img_shape: tuple,
+    img_out_channels: int,
+    rank_batches: list,
+    img_lr: torch.Tensor,
+    rank: int,
+    device: torch.device,
+    mean_hr: torch.Tensor = None,
+    lead_time_label: torch.Tensor = None,
+    patching: GridPatching2D = None,
+    distribution: str = "normal",
+    nu: int = None,
+    **kwargs,
+) -> torch.Tensor:
+    """
+    Modified diffusion step that supports patching for tiled generation.
+    """
+    # Check img_lr dimensions match expected shape
+    if img_lr.shape[2:] != img_shape:
+        raise ValueError(
+            f"img_lr shape {img_lr.shape[2:]} does not match expected shape img_shape {img_shape}"
+        )
+
+    # Check mean_hr dimensions if provided
+    if mean_hr is not None:
+        if mean_hr.shape[2:] != img_shape:
+            raise ValueError(
+                f"mean_hr shape {mean_hr.shape[2:]} does not match expected shape img_shape {img_shape}"
+            )
+        if mean_hr.shape[0] != 1:
+            raise ValueError(f"mean_hr must have batch size 1, got {mean_hr.shape[0]}")
+
+    img_lr = img_lr.to(memory_format=torch.channels_last)
+
+    # Handling of the high-res mean and patching
+    additional_args = {}
+    if mean_hr is not None:
+        additional_args["mean_hr"] = mean_hr
+    if lead_time_label is not None:
+        additional_args["lead_time_label"] = lead_time_label
+    if patching is not None:
+        additional_args["patching"] = patching
+
+    # Loop over batches - simplified to work with existing sampler
+    all_images = []
+    for batch_seeds in rank_batches:
+        with nvtx.annotate(f"generate {len(all_images)}", color="rapids"):
+            batch_size = len(batch_seeds)
+            if batch_size == 0:
+                continue
+
+            # Use a simple approach - just take first seed and convert to int
+            seed_int = int(batch_seeds[0]) if hasattr(batch_seeds[0], 'item') else int(batch_seeds[0])
+            torch.manual_seed(seed_int)
+            
+            latents_shape = [
+                img_lr.shape[0],
+                img_out_channels,
+                img_shape[0],
+                img_shape[1],
+            ]
+            latents = torch.randn(
+                latents_shape,
+                device=device,
+            ).to(memory_format=torch.channels_last)
+
+            with torch.inference_mode():
+                images = sampler_fn(
+                    net, latents, img_lr, **additional_args, **kwargs
+                )
+            all_images.append(images)
+    return torch.cat(all_images)
+
+# Custom regression step that supports patching
+def regression_step_with_patching(
+    net: torch.nn.Module,
+    img_lr: torch.Tensor,
+    latents_shape: tuple,
+    lead_time_label: torch.Tensor = None,
+    patching: GridPatching2D = None,
+) -> torch.Tensor:
+    """
+    Modified regression step that supports patching for tiled generation.
+    """
+    # Create a tensor of zeros with the given shape and move it to the appropriate device
+    x_hat = torch.zeros(latents_shape, dtype=torch.float64, device=net.device)
+
+    # Safety check: avoid silently ignoring batch elements in img_lr
+    if img_lr.shape[0] > 1:
+        raise ValueError(
+            f"Expected img_lr to have a batch size of 1, but found {img_lr.shape[0]}."
+        )
+
+    # Perform regression on a single batch element
+    with torch.inference_mode():
+        if patching is not None:
+            # Use patching for tiled inference
+            # Create patches from both inputs separately
+            x_hat_patches = patching.apply(input=x_hat[0:1])
+            img_lr_patches = patching.apply(input=img_lr)
+            
+            # Run the model on all patches at once
+            if lead_time_label is not None:
+                x_patches = net(x=x_hat_patches, img_lr=img_lr_patches, lead_time_label=lead_time_label)
+            else:
+                x_patches = net(x=x_hat_patches, img_lr=img_lr_patches)
+            
+            # Fuse the patches back into the full domain
+            x = patching.fuse(input=x_patches, batch_size=1)
+        else:
+            # Regular inference without patching
+            if lead_time_label is not None:
+                x = net(x=x_hat[0:1], img_lr=img_lr, lead_time_label=lead_time_label)
+            else:
+                x = net(x=x_hat[0:1], img_lr=img_lr)
+
+    # If the batch size is greater than 1, repeat the prediction
+    if x_hat.shape[0] > 1:
+        x = x.repeat([d if i == 0 else 1 for i, d in enumerate(x_hat.shape)])
+
+    return x
+
+from helpers.generate_helpers import (
+    get_dataset_and_sampler,
+    save_images,
+)
+from helpers.train_helpers import set_patch_shape
+from datasets.dataset import register_dataset
+
+
+import datetime
+
+def get_time_from_range(times_range, time_format="%Y-%m-%dT%H:%M:%S"):
+    """
+    Generates a list of times within a given range.
+
+    Args:
+        times_range: A list containing:
+            - start time (str)
+            - end time (str)
+            - optional interval (e.g. "1h", "3h", "1d").
+              Defaults to "1h" if not provided.
+        time_format: Format of input/output time strings.
+
+    Returns:
+        List of time strings within the specified range.
+    """
+
+    start_time = datetime.datetime.strptime(times_range[0], time_format)
+    end_time = datetime.datetime.strptime(times_range[1], time_format)
+
+    # Default interval = 1 hour
+    interval = datetime.timedelta(hours=1)
+    # Parse interval if provided
+    if len(times_range) > 2:
+        interval_arg = times_range[2]
+        if isinstance(interval_arg, str):
+            if interval_arg.endswith("h"):
+                hours = float(interval_arg[:-1])
+                interval = datetime.timedelta(hours=hours)
+            elif interval_arg.endswith("d"):
+                days = float(interval_arg[:-1])
+                interval = datetime.timedelta(days=days)
+            else:
+                raise ValueError(
+                    f"Unsupported interval format: '{interval_arg}'. Use 'h' or 'd'."
+                )
+        else:
+            # If it's numeric, assume hours (for backward compatibility)
+            interval = datetime.timedelta(hours=float(interval_arg))
+
+    # Generate timestamps
+    times = []
+    t = start_time
+    while t <= end_time:
+        times.append(t.strftime(time_format))
+        t += interval
+
+    return times
+
+
+
+@hydra.main(version_base="1.2", config_path="conf", config_name="config_generate")
+def main(cfg: DictConfig) -> None:
+    """Generate random images using the techniques described in the paper
+    "Elucidating the Design Space of Diffusion-Based Generative Models".
+    """
+
+    # Initialize distributed manager
+    DistributedManager.initialize()
+    dist = DistributedManager()
+    device = dist.device
+
+    # Initialize logger
+    logger = PythonLogger("generate")  # General python logger
+    logger0 = RankZeroLoggingWrapper(logger, dist)
+    logger.file_logging("generate.log")
+
+    # Handle the batch size
+    seeds = list(np.arange(cfg.generation.num_ensembles))
+    num_batches = (
+        (len(seeds) - 1) // (cfg.generation.seed_batch_size * dist.world_size) + 1
+    ) * dist.world_size
+    all_batches = torch.as_tensor(seeds).tensor_split(num_batches)
+    rank_batches = all_batches[dist.rank :: dist.world_size]
+
+    # Synchronize
+    if dist.world_size > 1:
+        torch.distributed.barrier()
+
+    # Parse the inference input times
+    if cfg.generation.times_range and cfg.generation.times:
+        raise ValueError("Either times_range or times must be provided, but not both")
+    if cfg.generation.times_range:
+        times = get_time_from_range(cfg.generation.times_range)
+    else:
+        times = cfg.generation.times
+
+    # Create dataset object
+    dataset_cfg = OmegaConf.to_container(cfg.dataset)
+
+    # Register dataset (if custom dataset)
+    register_dataset(cfg.dataset.type)
+    logger0.info(f"Using dataset: {cfg.dataset.type}")
+
+    if "has_lead_time" in cfg.generation:
+        has_lead_time = cfg.generation["has_lead_time"]
+    else:
+        has_lead_time = False
+    dataset, sampler = get_dataset_and_sampler(
+        dataset_cfg=dataset_cfg, times=times, has_lead_time=has_lead_time
+    )
+    img_shape = dataset.image_shape()
+    img_out_channels = len(dataset.output_channels())
+
+    # Parse the patch shape
+    patch_shape_x = getattr(cfg.generation, 'patch_shape_x', None)
+    patch_shape_y = getattr(cfg.generation, 'patch_shape_y', None)
+    
+    # If patch shapes are null or not specified, disable patching
+    if patch_shape_x is None or patch_shape_y is None:
+        patch_shape_x, patch_shape_y = None, None
+    patch_shape = (patch_shape_y, patch_shape_x)
+    use_patching, img_shape, patch_shape = set_patch_shape(img_shape, patch_shape)
+    if use_patching:
+        patching = GridPatching2D(
+            img_shape=img_shape,
+            patch_shape=patch_shape,
+            boundary_pix=cfg.generation.boundary_pix,
+            overlap_pix=cfg.generation.overlap_pix,
+        )
+        logger0.info("Patch-based training enabled")
+    else:
+        patching = None
+        logger0.info("Patch-based training disabled")
+
+    # Parse the inference mode
+    if cfg.generation.inference_mode == "regression":
+        load_net_reg, load_net_res = True, False
+    elif cfg.generation.inference_mode == "diffusion":
+        load_net_reg, load_net_res = False, True
+    elif cfg.generation.inference_mode == "all":
+        load_net_reg, load_net_res = True, True
+    else:
+        raise ValueError(f"Invalid inference mode {cfg.generation.inference_mode}")
+
+    # Load diffusion network, move to device, change precision
+    if load_net_res:
+        res_ckpt_filename = cfg.generation.io.res_ckpt_filename
+        logger0.info(f'Loading residual network from "{res_ckpt_filename}"...')
+        net_res = Module.from_checkpoint(
+            to_absolute_path(res_ckpt_filename),
+            override_args={
+                "use_apex_gn": getattr(cfg.generation.perf, "use_apex_gn", False)
+            },
+        )
+        net_res.profile_mode = getattr(cfg.generation.perf, "profile_mode", False)
+        net_res.use_fp16 = getattr(cfg.generation.perf, "use_fp16", False)
+        net_res = net_res.eval().to(device).to(memory_format=torch.channels_last)
+
+        # Disable AMP for inference (even if model is trained with AMP)
+        if hasattr(net_res, "amp_mode"):
+            net_res.amp_mode = False
+    else:
+        net_res = None
+
+    # load regression network, move to device, change precision
+    if load_net_reg:
+        reg_ckpt_filename = cfg.generation.io.reg_ckpt_filename
+        logger0.info(f'Loading network from "{reg_ckpt_filename}"...')
+        net_reg = Module.from_checkpoint(
+            to_absolute_path(reg_ckpt_filename),
+            override_args={
+                "use_apex_gn": getattr(cfg.generation.perf, "use_apex_gn", False)
+            },
+        )
+        net_reg.profile_mode = getattr(cfg.generation.perf, "profile_mode", False)
+        net_reg.use_fp16 = getattr(cfg.generation.perf, "use_fp16", False)
+        net_reg = net_reg.eval().to(device).to(memory_format=torch.channels_last)
+
+        # Disable AMP for inference (even if model is trained with AMP)
+        if hasattr(net_reg, "amp_mode"):
+            net_reg.amp_mode = False
+    else:
+        net_reg = None
+
+    # Reset since we are using a different mode.
+    if cfg.generation.perf.use_torch_compile:
+        torch._dynamo.config.cache_size_limit = 264
+        torch._dynamo.reset()
+        if net_res:
+            net_res = torch.compile(net_res)
+        if net_reg:
+            net_reg = torch.compile(net_reg)
+
+    # Partially instantiate the sampler based on the configs
+    if cfg.sampler.type == "deterministic":
+        sampler_fn = partial(
+            deterministic_sampler,
+            num_steps=cfg.sampler.num_steps,
+            # num_ensembles=cfg.generation.num_ensembles,
+            solver=cfg.sampler.solver,
+            patching=patching,
+        )
+    elif cfg.sampler.type == "stochastic":
+        sampler_fn = partial(stochastic_sampler, patching=patching)
+    else:
+        raise ValueError(f"Unknown sampling method {cfg.sampling.type}")
+
+    # Parse the distribution type
+    distribution = getattr(cfg.generation, "distribution", None)
+    student_t_nu = getattr(cfg.generation, "student_t_nu", None)
+    if distribution is not None and not cfg.generation.inference_mode in [
+        "diffusion",
+        "all",
+    ]:
+        raise ValueError(
+            f"cfg.generation.distribution should only be specified for "
+            f"inference mode 'diffusion' or 'all', but got {cfg.generation.inference_mode}."
+        )
+    if distribution not in ["normal", "student_t", None]:
+        raise ValueError(f"Invalid distribution: {distribution}.")
+    if distribution == "student_t":
+        if student_t_nu is None:
+            raise ValueError(
+                "student_t_nu must be provided in cfg.generation.student_t_nu for student_t distribution"
+            )
+        elif student_t_nu <= 2:
+            raise ValueError(f"Expected nu > 2, but got {student_t_nu}.")
+        if net_res and not isinstance(net_res, tEDMPrecondSuperRes):
+            logger0.warning(
+                f"Student-t distribution sampling is supposed to be used with "
+                f"tEDMPrecondSuperRes model, but got {type(net_res)}."
+            )
+    elif isinstance(net_res, tEDMPrecondSuperRes):
+        logger0.warning(
+            f"tEDMPrecondSuperRes model is supposed to be used with student-t "
+            f"distribution, but got {distribution}."
+        )
+
+    # Parse P_mean and P_std
+    P_mean = getattr(cfg.generation, "P_mean", None)
+    P_std = getattr(cfg.generation, "P_std", None)
+
+    # Main generation definition
+    def generate_fn(timestep_rank_batches):
+        with nvtx.annotate("generate_fn", color="green"):
+            diffusion_step_kwargs = {}
+            if distribution is not None:
+                diffusion_step_kwargs["distribution"] = distribution
+            if student_t_nu is not None:
+                diffusion_step_kwargs["nu"] = student_t_nu
+            if P_mean is not None:
+                diffusion_step_kwargs["P_mean"] = P_mean
+            if P_std is not None:
+                diffusion_step_kwargs["P_std"] = P_std
+
+            # (1, C, H, W)
+            img_lr = image_lr.to(memory_format=torch.channels_last)
+
+            if net_reg:
+                with nvtx.annotate("regression_model", color="yellow"):
+                    image_reg = regression_step_with_patching(
+                        net=net_reg,
+                        img_lr=img_lr,
+                        latents_shape=(
+                            sum(map(len, timestep_rank_batches)),
+                            img_out_channels,
+                            img_shape[0],
+                            img_shape[1],
+                        ),  # (batch_size, C, H, W)
+                        lead_time_label=lead_time_label,
+                        patching=patching,
+                    )
+            if net_res:
+                if cfg.generation.hr_mean_conditioning:
+                    mean_hr = image_reg[0:1]
+                else:
+                    mean_hr = None
+                with nvtx.annotate("diffusion model", color="purple"):
+                    image_res = diffusion_step_with_patching(
+                        net=net_res,
+                        sampler_fn=sampler_fn,
+                        img_shape=img_shape,
+                        img_out_channels=img_out_channels,
+                        rank_batches=timestep_rank_batches,
+                        img_lr=img_lr.expand(
+                            cfg.generation.seed_batch_size, -1, -1, -1
+                        ).to(memory_format=torch.channels_last),
+                        rank=dist.rank,
+                        device=device,
+                        mean_hr=mean_hr,
+                        lead_time_label=lead_time_label,
+                        patching=patching,
+                        **diffusion_step_kwargs,
+                    )
+            if cfg.generation.inference_mode == "regression":
+                image_out = image_reg
+            elif cfg.generation.inference_mode == "diffusion":
+                image_out = image_res
+            else:
+                image_out = image_reg + image_res
+
+            # Gather tensors on rank 0
+            if dist.world_size > 1:
+                if dist.rank == 0:
+                    gathered_tensors = [
+                        torch.zeros_like(
+                            image_out, dtype=image_out.dtype, device=image_out.device
+                        )
+                        for _ in range(dist.world_size)
+                    ]
+                else:
+                    gathered_tensors = None
+
+                torch.distributed.barrier()
+                gather(
+                    image_out,
+                    gather_list=gathered_tensors if dist.rank == 0 else None,
+                    dst=0,
+                )
+
+                if dist.rank == 0:
+                    return torch.cat(gathered_tensors)
+                else:
+                    return None
+            else:
+                return image_out
+        return
+
+    # generate images
+    output_path = getattr(cfg.generation.io, "output_filename", "corrdiff_output.nc")
+    logger0.info(f"Generating images, saving results to {output_path}...")
+    batch_size = 1
+    warmup_steps = min(len(times) - 1, 2)
+    # Generates model predictions from the input data using the specified
+    # `generate_fn`, and save the predictions to the provided NetCDF file. It iterates
+    # through the dataset using a data loader, computes predictions, and saves them along
+    # with associated metadata.
+    if dist.rank == 0:
+        f = nc.Dataset(output_path, "w")
+        # add attributes
+        f.cfg = str(cfg)
+
+    torch_cuda_profiler = (
+        torch.cuda.profiler.profile()
+        if torch.cuda.is_available()
+        else contextlib.nullcontext()
+    )
+    torch_nvtx_profiler = (
+        torch.autograd.profiler.emit_nvtx()
+        if torch.cuda.is_available()
+        else contextlib.nullcontext()
+    )
+    with torch_cuda_profiler:
+        with torch_nvtx_profiler:
+            data_loader = torch.utils.data.DataLoader(
+                dataset=dataset, sampler=sampler, batch_size=1, pin_memory=True
+            )
+            first_image = dataset[0]
+            
+            time_index = -1
+            if dist.rank == 0:
+                writer = NetCDFWriter(
+                    f,
+                    lat=dataset.latitude(),
+                    lon=dataset.longitude(),
+                    input_channels=dataset.input_channels(),
+                    output_channels=dataset.output_channels(),
+                    has_lead_time=has_lead_time,
+                )
+
+                if cfg.generation.perf.io_synchronous:
+                    writer_executor = ThreadPoolExecutor(
+                        max_workers=cfg.generation.perf.num_writer_workers
+                    )
+                    writer_threads = []
+
+            # Create timer objects only if CUDA is available
+            use_cuda_timing = torch.cuda.is_available()
+            if use_cuda_timing:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+            else:
+                # Dummy no-op functions for CPU case
+                class DummyEvent:
+                    def record(self):
+                        pass
+
+                    def synchronize(self):
+                        pass
+
+                    def elapsed_time(self, _):
+                        return 0
+
+                start = end = DummyEvent()
+
+            times = dataset.time()
+            for dataset_index, (image_tar, image_lr, *lead_time_label) in zip(
+                sampler,
+                iter(data_loader),
+            ):
+                time_index += 1
+                if dist.rank == 0:
+                    logger0.info(f"starting index: {time_index}")
+                
+                # Make seeds timestep-dependent for consistency across spatial patches
+                # This ensures each (ensemble_member, timestep) combination gets a unique but deterministic seed
+                timestep_rank_batches = [
+                    [seed + time_index * cfg.generation.num_ensembles for seed in batch]
+                    for batch in rank_batches
+                ]
+
+                if time_index == warmup_steps:
+                    start.record()
+
+                # continue
+                if lead_time_label:
+                    lead_time_label = lead_time_label[0].to(dist.device).contiguous()
+                else:
+                    lead_time_label = None
+                image_lr = (
+                    image_lr.to(device=device)
+                    .to(torch.float32)
+                    .to(memory_format=torch.channels_last)
+                )
+                image_tar = image_tar.to(device=device).to(torch.float32)
+                image_out = generate_fn(timestep_rank_batches)
+                if dist.rank == 0:
+                    batch_size = image_out.shape[0]
+                    if cfg.generation.perf.io_synchronous:
+                        # write out data in a seperate thread so we don't hold up inferencing
+                        writer_threads.append(
+                            writer_executor.submit(
+                                save_images,
+                                writer,
+                                dataset,
+                                list(times),
+                                image_out.cpu(),
+                                image_tar.cpu(),
+                                image_lr.cpu(),
+                                time_index,
+                                dataset_index,
+                            )
+                        )
+                    else:
+                        save_images(
+                            writer,
+                            dataset,
+                            list(times),
+                            image_out.cpu(),
+                            image_tar.cpu(),
+                            image_lr.cpu(),
+                            time_index,
+                            dataset_index,
+                        )
+            end.record()
+            end.synchronize()
+            elapsed_time = (
+                start.elapsed_time(end) / 1000.0 if use_cuda_timing else 0
+            )  # Convert ms to s
+            timed_steps = time_index + 1 - warmup_steps
+            if dist.rank == 0 and use_cuda_timing:
+                average_time_per_batch_element = elapsed_time / timed_steps / batch_size
+                logger.info(
+                    f"Total time to run {timed_steps} steps and {batch_size} members = {elapsed_time} s"
+                )
+                logger.info(
+                    f"Average time per batch element = {average_time_per_batch_element} s"
+                )
+
+            # make sure all the workers are done writing
+            if dist.rank == 0 and cfg.generation.perf.io_synchronous:
+                for thread in list(writer_threads):
+                    thread.result()
+                    writer_threads.remove(thread)
+                writer_executor.shutdown()
+
+    if dist.rank == 0:
+        f.close()
+    logger0.info("Generation Completed.")
+
+
+if __name__ == "__main__":
+    main()

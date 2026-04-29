@@ -1,0 +1,49 @@
+hydra:
+    job:
+          chdir: false
+          name: generate_mswxdwd_patches
+    run:
+          dir: ./outputs/${hydra:job.name}
+    searchpath:
+          - pkg://conf/base # Do not modify
+
+# Base parameters for dataset, model, and generation
+defaults:
+
+    - dataset: mswxdwd
+    # The dataset type for generation.
+
+    - generation: non_patched
+    # The base generation parameters.
+    # Use non_patched since we handle patching at dataset level
+
+# Dataset parameters for patch-based generation
+dataset:
+    data_path: /beegfs/muduchuru/data/
+    stats_dwd: /beegfs/muduchuru/data/HYRAS_DAILY/hyras_stats.json
+    stats_mswx: /beegfs/muduchuru/data/mswx/mswx_stats.json
+    patch_size: [128, 128]  # Patch size
+    patch_index: 0  # Will be overridden by script
+    overlap_pix: 0  # Non-overlapping patches
+    train: False  # Will be overridden by script
+
+# Generation parameters
+generation:
+    inference_mode: all
+    num_ensembles: 8
+    # int, number of ensembles to generate per input
+    seed_batch_size: 4
+    # int, size of the batched inference (should be num_ensembles / num_gpus)
+    
+    # No tiling at generation level - handled by dataset patching
+    patch_shape_x: null
+    patch_shape_y: null
+    overlap_pix: null
+    boundary_pix: null
+    times_range: [2024-01-01T00:00:00, 2024-01-02T00:00:00, 1d]
+    times: null
+
+    io:
+        output_path: ./generated/patches
+        res_ckpt_filename: checkpoints_diffusion_mswxdwd/checkpoints_diffusion/EDMPrecondSuperResolution.0.860000.mdlus
+        reg_ckpt_filename: checkpoints_regression_mswxdwd/checkpoints_regression/UNet.0.865008.mdlus

@@ -1,0 +1,35 @@
+hydra:
+    job:
+          chdir: false
+          name: mswxdwd_regression
+    run:
+          dir: ./output/${hydra:job.name}
+    searchpath:
+          - pkg://conf/base # Do not modify
+
+# Base parameters for dataset, model, training, and validation
+defaults:
+
+    - dataset: mswxdwd
+    - model: regression
+    - model_size: normal
+    - training: ${model}
+dataset:
+    data_path: /beegfs/muduchuru/data/
+    stats_dwd: /beegfs/muduchuru/data/HYRAS_DAILY/hyras_stats.json
+    stats_mswx: /beegfs/muduchuru/data/mswx/mswx_stats.json
+validation:
+    data_path: /beegfs/muduchuru/data/
+    stats_dwd: /beegfs/muduchuru/data/HYRAS_DAILY/hyras_stats.json
+    stats_mswx: /beegfs/muduchuru/data/mswx/mswx_stats.json
+    val_years: [2021, 2024]  # or your desired validation years
+training:
+    hp:
+        training_duration: 1000000
+        patch_shape_x: 128
+        patch_shape_y: 128
+        patch_num: 1
+wandb:
+    mode: offline
+    results_dir: "./wandb"
+    watch_model: false

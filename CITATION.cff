@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+type: software
+title: CasCorrDiff - Cascading Correction Diffusion Models for Atmospheric Downscaling
+abstract: "A comprehensive framework for generative downscaling and climate data correction using diffusion models, combining deterministic regression and stochastic diffusion approaches for km-scale weather prediction."
+authors:
+  - family-names: "Muduchuru"
+    given-names: "Kaushik"
+    orcid: "https://orcid.org/0000-0002-8967-7872"
+repository-code: "https://github.com/Kaushikreddym/CasCorrDiff"
+repository-artifact: "https://zenodo.org/records/[record-id]"
+url: "https://github.com/Kaushikreddym/CasCorrDiff"
+keywords:
+  - downscaling
+  - diffusion models
+  - weather prediction
+  - climate modeling
+  - deep learning
+  - atmospheric science
+license: MIT
+version: "1.0.0"
+date-released: 2026-04-29
+
+preferred-citation:
+  type: software
+  title: "CasCorrDiff - Cascading Correction Diffusion Models for Atmospheric Downscaling"
+  authors:
+    - family-names: "Muduchuru"
+      given-names: "Kaushik"
+  year: 2026
+  url: "https://github.com/Kaushikreddym/CasCorrDiff"
