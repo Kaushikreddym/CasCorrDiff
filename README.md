@@ -142,6 +142,8 @@ jupyter notebook diffusion_output_processing/diffusion_spatial_patterns.ipynb
 
 ## Citation
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19879687.svg)](https://doi.org/10.5281/zenodo.19879687)
+
 If you use CasCorrDiff in your research, please cite:
 
 ```bibtex
@@ -149,8 +151,8 @@ If you use CasCorrDiff in your research, please cite:
   author = {Muduchuru, Kaushik},
   title = {CasCorrDiff: Cascading Correction Diffusion Models for Atmospheric Downscaling},
   year = {2026},
-  url = {https://github.com/[username]/CasCorrDiff},
-  note = {Software available at https://zenodo.org/records/[record-id]}
+  doi = {10.5281/zenodo.19879687},
+  url = {https://zenodo.org/records/19879687}
 }
 ```
 

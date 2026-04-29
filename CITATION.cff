@@ -7,7 +7,7 @@ authors:
     given-names: "Kaushik"
     orcid: "https://orcid.org/0000-0002-8967-7872"
 repository-code: "https://github.com/Kaushikreddym/CasCorrDiff"
-repository-artifact: "https://zenodo.org/records/[record-id]"
+repository-artifact: "https://zenodo.org/records/19879687"
 url: "https://github.com/Kaushikreddym/CasCorrDiff"
 keywords:
   - downscaling
@@ -42,4 +42,5 @@ preferred-citation:
     - family-names: "Muduchuru"
       given-names: "Kaushik"
   year: 2026
-  url: "https://github.com/Kaushikreddym/CasCorrDiff"
+  doi: "10.5281/zenodo.19879687"
+  url: "https://zenodo.org/records/19879687"
