@@ -146,7 +146,7 @@ If you use CasCorrDiff in your research, please cite:
 
 ```bibtex
 @software{muduchuru2026cascorrdiff,
-  author = {Muduchuru, [Author Name]},
+  author = {Muduchuru, Kaushik},
   title = {CasCorrDiff: Cascading Correction Diffusion Models for Atmospheric Downscaling},
   year = {2026},
   url = {https://github.com/[username]/CasCorrDiff},
@@ -154,32 +154,11 @@ If you use CasCorrDiff in your research, please cite:
 }
 ```
 
-For the original CorrDiff method, see:
-
-```bibtex
-@article{subramanian2023corrdiff,
-  title={CorrDiff: Stochastic Correction Diffusion Models for Estimating Uncertainty in High-Resolution Image Synthesis},
-  author={Subramanian, Stéphane and others},
-  year={2023},
-  eprint={2309.15214},
-  archivePrefix={arXiv}
-}
-```
-
 ## License
 
 This project is licensed under the [LICENSE](LICENSE) - see file for details.
 
-## Contributing
-
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
 ## Acknowledgments
 
-- Original CorrDiff model: [arXiv:2309.15214](https://arxiv.org/abs/2309.15214)
-- Built with PyTorch, PyTorch Lightning, and Hydra
-- Data sources: ERA5, HRRR, GEFS, MSWX, Taiwan CWB
-
-## Contact
-
-For questions or issues, please open a GitHub issue or contact the maintainers.
+- Built with physicsnemo, PyTorch, PyTorch Lightning, and Hydra
+- Data sources: ERA5, MSWX, DWD, GHCNd
